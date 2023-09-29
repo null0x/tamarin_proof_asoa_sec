@@ -1,0 +1,182 @@
+/*
+	*********************************************************************
+	FORMAL PROOF FOR OUR TOKEN DISTRIBUTION PROTOCOL AS SHOWN IN FIGURE 6
+	*********************************************************************
+*/
+
+theory token_distribution
+begin
+
+builtins: diffie-hellman, symmetric-encryption, signing
+	
+functions: mac/2
+
+equations: sdec(senc(m, k), k) = m
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Initialization and deployment rules
+	
+/*
+	The OnlyOnce() action ensures that the keys are generated only once. Otherwise, the attacker can re-create keys
+ 	such that the lemmas cannot be proven any more.
+*/	
+rule Deploy_ID_Keys:
+	[Fr(~id_key)]
+	--[
+		OnlyOnce(),
+		Has_ID_Key_ECU(~id_key),
+		Has_ID_Key_ASP(~id_key)
+		]->
+	[!ID_Key_ECU(~id_key), !ID_Key_ASP(~id_key)]	
+	
+rule Create_SK:
+	[Fr(~sk)]
+	-->
+	[!SK($A, ~sk)]
+	
+// --------------------------------------------------------------------------------------------------------------------------
+// Protocol steps
+
+rule ecu_send_token_request:
+	let
+		ecupubkey = 'g'^sk
+		req = <$ECU, ~ecunonce, ecupubkey>
+	in
+	[Fr(~ecunonce), !ID_Key_ECU(id_key), !SK($ECU, sk)]
+	--[ 
+		Send_1($ECU, req),
+		Secret(id_key),
+		Secret(sk)
+		]->
+	[Out(<req, mac(req, id_key)>)]
+	
+rule asp_receive_request_send_tokens:
+	let
+		asppubkey = 'g'^sk
+		rcdash = ecupubkey^sk
+		enc_tokens = senc(~tokens, rcdash)
+		enc_nonce = senc(~aspnonce, rcdash) 
+		req = <$ECU, ecunonce, ecupubkey>
+		reply = <$ASP, asppubkey, enc_nonce, enc_tokens>
+	in
+		[Fr(~aspnonce), Fr(~tokens), !SK($ASP, sk), !ID_Key_ASP(id_key), In(<req, mac(req, id_key)>)]
+	--[	
+		Recv_1($ASP, req)
+		, Send_2($ASP, reply)
+		, Authentic($ECU, req)
+		, Secret_Nonce(~aspnonce)
+		, Secret(~tokens)
+		, Freshness(ecunonce)
+		, Secret(sk)
+		, Secret(id_key)
+		, Tokens_Created($ECU, ~tokens)
+		, ASP_Update_Key($ASP, rcdash)
+		]->
+	[Step_2($ASP, ~aspnonce, ~tokens), Out(reply)]
+
+rule ecu_receive_tokens_send_nonce:
+	let
+		rcdash = asppubkey^sk
+		dec_nonce = sdec(enc_nonce, rcdash)
+		dec_tokens = sdec(enc_tokens, rcdash)
+		reply = <$ASP, asppubkey, enc_nonce, enc_tokens>
+	in
+	[Step_2($ASP, aspnonce, tokens), !ID_Key_ECU(id_key), !SK($ECU, sk), In(reply)]
+	--[	
+		Recv_2($ECU, reply)
+		, Send_3($ECU, dec_nonce)
+		, ECU_Update_Key($ECU, rcdash)
+		, Secret(id_key)
+		, Secret(sk)
+		, Nonce_Revealed(aspnonce)
+		, Eq(aspnonce, dec_nonce)
+		, Eq(tokens, dec_tokens)			
+		, Tokens_Received($ECU, tokens)
+		]->
+	[Out(<$ECU, dec_nonce>)]
+
+	
+rule asp_receive_nonce:
+	[In(<$ECU, aspnonce>)]
+	--[	
+		Recv_3($ASP, aspnonce)
+		, Fin($ASP, aspnonce)
+		]->
+	[]
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Restrictions
+
+restriction UniqueNonce:
+  "not(Ex n1 n2 #i #j. Freshness(n1)@#i & Freshness(n2)@#j & n1 = n2 & not(#i = #j))"
+	
+restriction OnlyOnce:
+  "All #i #j. OnlyOnce()@#i & OnlyOnce()@#j ==> #i = #j"
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"  
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Security Lemmas
+
+// This lemma proves the authentic transmission of ECU's public key to the ASP. 
+// Without this guarantee, an attacker could perform a MitM attack and forge the computation of the identity key.
+lemma Authentic_ECU_PK: 
+    "All b m #i. Authentic(b,m) @i
+     ==> (Ex #j. Send_1(b,m) @j & j<i)"
+     
+lemma Fresh_ECU_PK:
+	"All n1 n2 #i #j. (Freshness(n1)@i & Freshness(n2)@j & not(#i = #j) ==> not(n1 = n2))"
+
+// This lemma proves that the attacker never learns confidential data that is put on the wire. This includes the security
+// tokens and the aspnonce until it is published by the ECU.
+lemma Secret_Transmission:
+  "(All x #i.
+    	Secret(x) @i ==> not (Ex #j. K(x)@j))	&
+   (All x #i.
+	(Secret_Nonce(x)@i & not(Nonce_Revealed(x)@i)) ==> (not(Ex #j. K(x)@j & (j < i)) & not(K(x)@i)))"
+
+// This lemma proves that both the ECU and the ASP eventually share the same secret tokens. For an attacker, 
+// it is impossible to forge them during transmission.    
+lemma Same_Tokens:
+	"All ecu  x #i #j .
+		Tokens_Created(ecu, x)@i & Tokens_Received(ecu, x)@j  ==> not(Ex #k. K(x)@k & j < k) & i < j "
+	
+// This lemma proves that the attacker never learns the identity key and therefore is not able to impersonate any
+// legitimate ECU
+lemma ID_Key_Never_Leaked:
+	"(All ECU rcdash #i.
+			ECU_Update_Key(ECU, rcdash)@i ==> not (Ex #j. K(rcdash)@j)) & 
+	 (All ASP rcdash #i.
+			ASP_Update_Key(ASP, rcdash)@i ==> not (Ex #j. K(rcdash)@j)) & 
+	 (All id_key #i.
+			Has_ID_Key_ASP(id_key)@i ==> not (Ex #j. K(id_key)@j)) &
+	 (All id_key #i.
+			Has_ID_Key_ECU(id_key)@i ==> not (Ex #j. K(id_key)@j))"
+		
+// --------------------------------------------------------------------------------------------------------------------------
+// Operational Lemmas
+
+// This lemma proves that the protocol is executable and logically well defined.
+lemma Executable_and_Terminable:
+    exists-trace
+      "	Ex ECU ASP request reply ack #req_sent #req_recv #reply_sent #reply_recv #ack_sent #ack_recv. 
+      	(Send_1(ECU,request)@ #req_sent & Recv_1(ASP,request)@ #req_recv & 
+      	Send_2(ASP,reply)@ #reply_sent & Recv_2(ECU,reply)@ #reply_recv & 
+      	Send_3(ECU,ack)@ #ack_sent & Recv_3(ASP,ack) @ #ack_recv & 
+      	req_sent < req_recv &
+      	req_recv < reply_sent &
+      	reply_sent < reply_recv &
+      	reply_recv < ack_sent &
+      	ack_sent < ack_recv)
+      "          
+      
+// This lemma proves that the ECU only updates its identity key after the ASP has already computed the new key.
+lemma ASP_Update_After_ECU_Update:
+    "All ecu rcdash #i.
+        ECU_Update_Key(ecu, rcdash) @ i 
+            ==> (Ex asp #j. ASP_Update_Key(asp, rcdash) @ j
+                 & j < i)"	
+                 
+// --------------------------------------------------------------------------------------------------------------------------                 
+end

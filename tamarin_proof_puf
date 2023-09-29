@@ -1,0 +1,155 @@
+/*
+	*********************************************************************
+	FORMAL PROOF FOR OUR TOKEN DISTRIBUTION PROTOCOL AS SHOWN IN FIGURE 7
+	*********************************************************************
+*/
+
+theory token_distribution_puf
+begin
+
+builtins: symmetric-encryption, signing, xor
+	
+functions: mac/2, puf_response/1 [private]
+
+equations: sdec(senc(m, k), k) = m
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Initialization and deployment rules
+	
+rule Create_SK:
+	[Fr(~sk)]
+	-->
+	[!SK($A, ~sk)]
+	
+// --------------------------------------------------------------------------------------------------------------------------
+// Protocol steps
+
+rule ecu_send_token_request:
+	let
+		req = <$ECU, ~ecunonce>
+	in
+	[Fr(~ecunonce)]
+	--[ 
+		Send_1($ECU, req)
+		]->
+	[Out(<req>)]
+
+rule asp_receive_request_send_tokens:
+	let
+		enc_tokens = senc(~tokens, rc)
+		enc_nonce = senc(~aspnonce, rc) 
+        	fc = puf_response(~challenge)
+        	hd = fc XOR rc
+		req = <$ECU, ecunonce>
+		reply = <$ASP, ~challenge, hd, enc_nonce, enc_tokens>
+	in
+	[Fr(~aspnonce), Fr(~tokens), Fr(~challenge), !SK($ASP, rc), In(<req>)]
+	--[	
+		Recv_1($ASP, req)
+		, Send_2($ASP, reply)
+		, Secret_Nonce(~aspnonce)
+		, Secret(~tokens)
+		, Freshness(ecunonce)
+		, Secret(rc)
+   		, Secret(fc)
+		, Tokens_Created($ECU, ~tokens)
+		, ASP_Update_Key($ASP, rc)
+		]->
+	[Step_2($ASP, ~aspnonce, ~tokens), Out(reply)]
+
+
+rule ecu_receive_tokens_send_nonce:
+	let
+		reply = <$ASP, challenge, hd, enc_nonce, enc_tokens>
+        	r = puf_response(challenge)
+        	rc = r XOR hd
+		dec_nonce = sdec(enc_nonce, rc)
+		dec_tokens = sdec(enc_tokens, rc)
+	in
+	[Step_2($ASP, aspnonce, tokens), In(reply)]
+	--[	
+		Recv_2($ECU, reply)
+		, Send_3($ECU, dec_nonce)
+		, ECU_Update_Key($ECU, rc)
+		, Nonce_Revealed(aspnonce)
+		, Eq(aspnonce, dec_nonce)
+		, Eq(tokens, dec_tokens)			
+		, Tokens_Received($ECU, tokens)
+		]->
+	[Out(<$ECU, dec_nonce>)] 
+
+	
+rule asp_receive_nonce:
+	[In(<$ECU, aspnonce>)]
+	--[	
+		  Recv_3($ASP, aspnonce)
+		, Fin($ASP, aspnonce)
+	  	]->
+	[]
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Restrictions
+
+restriction UniqueNonce:
+  "not(Ex n1 n2 #i #j. Freshness(n1)@#i & Freshness(n2)@#j & n1 = n2 & not(#i = #j))"
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"  
+
+// --------------------------------------------------------------------------------------------------------------------------
+// Security Lemmas
+     
+lemma Fresh_Request:
+  "All n1 n2 #i #j. (Freshness(n1)@i & Freshness(n2)@j & not(#i = #j) ==> not(n1 = n2))"
+
+// This lemma proves that the attacker never learns confidential data that is put on the wire. This includes the security
+// tokens and the aspnonce until it is published by the ECU.
+lemma Secret_Transmission:
+  "(All x #i.
+    	Secret(x) @i ==> not (Ex #j. K(x)@j))	&
+   (All x #i.
+	    ((Secret_Nonce(x)@i & not(Nonce_Revealed(x)@i)) // At point i x is secret and not revealed
+		 ==> (not(Ex #j. K(x)@j & (j < i)) & // x is not known to attacker before i
+			  not(K(x)@i))) // x is not known to attacker at point i
+	)"
+
+// This lemma proves that both the ECU and the ASP eventually share the same secret tokens. For an attacker, 
+// it is impossible to forge them during transmission.    
+lemma Same_Tokens:
+	"All ecu  x #i #j .
+		Tokens_Created(ecu, x)@i & Tokens_Received(ecu, x)@j  ==> not(Ex #k. K(x)@k & j < k) & i < j "
+	
+// This lemma proves that the attacker never learns the identity key and therefore is not able to impersonate any
+// legitimate ECU
+lemma ID_Key_Never_Leaked:
+	"(All ECU rcdash #i.
+			ECU_Update_Key(ECU, rcdash)@i ==> not (Ex #j. K(rcdash)@j)) & 
+	 (All ASP rcdash #i.
+			ASP_Update_Key(ASP, rcdash)@i ==> not (Ex #j. K(rcdash)@j))"
+		
+// --------------------------------------------------------------------------------------------------------------------------
+// Operational Lemmas
+
+// This lemma proves that the protocol is executable and logically well defined.
+lemma Executable_and_Terminable:
+    exists-trace
+      "	Ex ECU ASP request reply ack #req_sent #req_recv #reply_sent #reply_recv #ack_sent #ack_recv. 
+      	(Send_1(ECU,request)@ #req_sent & Recv_1(ASP,request)@ #req_recv & 
+      	Send_2(ASP,reply)@ #reply_sent & Recv_2(ECU,reply)@ #reply_recv & 
+      	Send_3(ECU,ack)@ #ack_sent & Recv_3(ASP,ack) @ #ack_recv & 
+      	req_sent < req_recv &
+      	req_recv < reply_sent &
+      	reply_sent < reply_recv &
+      	reply_recv < ack_sent &
+      	ack_sent < ack_recv)
+      "          
+      
+// This lemma proves that the ECU only updates its identity key after the ASP has already computed the new key.
+lemma ASP_Update_After_ECU_Update:
+    "All ecu rcdash #i.
+        ECU_Update_Key(ecu, rcdash) @ i 
+            ==> (Ex asp #j. ASP_Update_Key(asp, rcdash) @ j
+                 & j < i)"	
+                 
+// --------------------------------------------------------------------------------------------------------------------------                 
+end
